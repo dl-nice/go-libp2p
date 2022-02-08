@@ -12,7 +12,10 @@ import (
 	rcmgr "github.com/libp2p/go-libp2p-resource-manager"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
+
+	"github.com/stretchr/testify/require"
 )
 
 func makeRcmgrOption(t *testing.T, limiter *rcmgr.BasicLimiter, test string) func(int) libp2p.Option {
@@ -37,12 +40,19 @@ func closeRcmgrs(echos []*Echo) {
 	}
 }
 
+func waitForConnection(t *testing.T, src, dest *Echo) {
+	require.Eventually(t, func() bool {
+		return src.Host.Network().Connectedness(dest.Host.ID()) == network.Connected &&
+			dest.Host.Network().Connectedness(src.Host.ID()) == network.Connected
+	}, time.Second, time.Millisecond)
+}
+
 func TestResourceManagerConnInbound(t *testing.T) {
 	// this test checks that we can not exceed the inbound conn limit at system level
 	// we specify: 1 conn per peer, 3 conns total, and we try to create 4 conns
 	limiter := rcmgr.NewDefaultLimiter()
 	limiter.SystemLimits = limiter.SystemLimits.WithConnLimit(3, 1024, 1024)
-	limiter.DefaultPeerLimits = limiter.DefaultPeerLimits.WithConnLimit(1, 16, 16)
+	limiter.DefaultPeerLimits = limiter.DefaultPeerLimits.WithConnLimit(1, 1, 1)
 
 	echos := createEchos(t, 5, makeRcmgrOption(t, limiter, "TestResourceManagerConnInbound"))
 	defer closeEchos(echos)
@@ -53,7 +63,7 @@ func TestResourceManagerConnInbound(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		waitForConnection(t, echos[i], echos[0])
 	}
 
 	for i := 1; i < 4; i++ {
@@ -74,7 +84,7 @@ func TestResourceManagerConnOutbound(t *testing.T) {
 	// we specify: 1 conn per peer, 3 conns total, and we try to create 4 conns
 	limiter := rcmgr.NewDefaultLimiter()
 	limiter.SystemLimits = limiter.SystemLimits.WithConnLimit(1024, 3, 1024)
-	limiter.DefaultPeerLimits = limiter.DefaultPeerLimits.WithConnLimit(16, 1, 16)
+	limiter.DefaultPeerLimits = limiter.DefaultPeerLimits.WithConnLimit(1, 1, 1)
 	echos := createEchos(t, 5, makeRcmgrOption(t, limiter, "TestResourceManagerConnOutbound"))
 	defer closeEchos(echos)
 	defer closeRcmgrs(echos)
@@ -84,7 +94,7 @@ func TestResourceManagerConnOutbound(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		waitForConnection(t, echos[0], echos[i])
 	}
 
 	for i := 1; i < 4; i++ {
@@ -109,20 +119,24 @@ func TestResourceManagerServiceInbound(t *testing.T) {
 	defer closeEchos(echos)
 	defer closeRcmgrs(echos)
 
-	ready := make(chan struct{})
-	echos[0].BeforeDone(waitForChannel(ready, time.Minute))
-
 	for i := 1; i < 5; i++ {
 		err := echos[i].Host.Connect(context.Background(), peer.AddrInfo{ID: echos[0].Host.ID()})
 		if err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		waitForConnection(t, echos[i], echos[0])
 	}
+
+	ready := make(chan struct{})
+	echos[0].BeforeDone(waitForChannel(ready, time.Minute))
+
+	var eg sync.WaitGroup
+	echos[0].Done(eg.Done)
 
 	var once sync.Once
 	var wg sync.WaitGroup
 	for i := 1; i < 5; i++ {
+		eg.Add(1)
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -137,6 +151,7 @@ func TestResourceManagerServiceInbound(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+	eg.Wait()
 
 	checkEchoStatus(t, echos[0], EchoStatus{
 		StreamsIn:             4,
@@ -157,21 +172,22 @@ func TestResourceManagerServicePeerInbound(t *testing.T) {
 	defer closeEchos(echos)
 	defer closeRcmgrs(echos)
 
-	count := new(int32)
-	ready := make(chan struct{})
-	*count = 4
-	echos[0].BeforeDone(waitForBarrier(count, ready, time.Minute))
-
 	for i := 1; i < 5; i++ {
 		err := echos[i].Host.Connect(context.Background(), peer.AddrInfo{ID: echos[0].Host.ID()})
 		if err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		waitForConnection(t, echos[i], echos[0])
 	}
+
+	echos[0].BeforeDone(waitForBarrier(4, time.Minute))
+
+	var eg sync.WaitGroup
+	echos[0].Done(eg.Done)
 
 	var wg sync.WaitGroup
 	for i := 1; i < 5; i++ {
+		eg.Add(1)
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -183,6 +199,7 @@ func TestResourceManagerServicePeerInbound(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+	eg.Wait()
 
 	checkEchoStatus(t, echos[0], EchoStatus{
 		StreamsIn:             4,
@@ -191,11 +208,12 @@ func TestResourceManagerServicePeerInbound(t *testing.T) {
 		ResourceServiceErrors: 0,
 	})
 
-	ready = make(chan struct{})
+	ready := make(chan struct{})
 	echos[0].BeforeDone(waitForChannel(ready, time.Minute))
 
 	var once sync.Once
 	for i := 0; i < 3; i++ {
+		eg.Add(1)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -210,6 +228,7 @@ func TestResourceManagerServicePeerInbound(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	eg.Wait()
 
 	checkEchoStatus(t, echos[0], EchoStatus{
 		StreamsIn:             7,
@@ -219,9 +238,12 @@ func TestResourceManagerServicePeerInbound(t *testing.T) {
 	})
 }
 
-func waitForBarrier(count *int32, ready chan struct{}, timeout time.Duration) func() error {
+func waitForBarrier(count int32, timeout time.Duration) func() error {
+	ready := make(chan struct{})
+	wait := new(int32)
+	*wait = count
 	return func() error {
-		if atomic.AddInt32(count, -1) == 0 {
+		if atomic.AddInt32(wait, -1) == 0 {
 			close(ready)
 		}
 
